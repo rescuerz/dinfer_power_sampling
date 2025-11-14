@@ -15,7 +15,7 @@
 ## Introduction
 dInfer is an efficient and extensible inference framework for dLLMs. As illustrated in the following architecture, it modularizes inference into four components:
 *model*, *diffusion iteration manager*, *decoder* and *KV-cache manager*. It provides well-designed APIs for
-flexible algorithms combinations in each component. Now supports batched inference for improved throughput.
+flexible algorithms combinations in each component. It now supports batched inference for improved throughput.
 
 <p align="center">
   <img src="assets/Framework2.png" alt="dInfer v0.1 architecture" width="600">
@@ -109,7 +109,7 @@ dInfer supports multiple diffusion language model variants with different archit
 
 ## Getting Started
 
-Please follow the instruction below to install dInfer.
+Please follow the instructions below to install dInfer.
 
 ```
 git clone https://github.com/inclusionAI/dInfer.git
@@ -127,7 +127,7 @@ This project supports using LLaDA and LLaDA-MoE checkpoints from HuggingFace. Af
 pip install -U huggingface_hub hf_transfer
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Example: Instruct checkpoint
+# Example: download Instruct checkpoint
 hf download inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
   --repo-type model \
   --local-dir /path/to/LLaDA-MoE-7B-A1B-Instruct
@@ -185,24 +185,22 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
     --warmup_times 4 \
     --cont_weight 0.3
   ```
-  - Example 2 (threshold decoder, TP across 4 GPUs, LLaDA2-mini):
-  - **Currently, we only support up to 4-way parallelism for LLaDA2 since the number of heads is 4.**
+  - Example 2 (LLaDA-8B-Instruct, threshold decoder, TP across 4 GPUs):
+  - **Currently, we only support up to 4-way parallelism for LLaDA dense since the number of heads is 4.**
+  > ⚠️ **Note**: For LLaDA dense models, `--use_bd` is not supported.
   ```
-  python benchmarks/benchmark_dataset.py \
-    --model_name inclusionAI/LLaDA2.0-mini-preview \
-    --model_type llada2 \
-    --dataset dataset_path \
+  python benchmarks/benchmark.py \
+    --model_name GSAI-ML/LLaDA-8B-Instruct \
+    --model_type llada \
     --gen_len 2048 \
     --block_length 32 \
     --gpu 0,1,2,3 \
-    --output_dir runs/llada2_mini \
     --use_tp \
     --parallel_decoding threshold \
     --threshold 0.9 \
-    --cache prefix \
-    --use_bd
+    --cache prefix
   ```
-  - Example 3 (threshold decoder, TP across 4 GPUs, LLaDA2-flash):
+  - Example 3 (LLaDA2-flash, threshold decoder, TP across 4 GPUs):
   -  **Currently, we only support up to 4-way parallelism for LLaDA2 since the number of heads is 4.**
   ```shell
     python benchmarks/benchmark_dataset.py \
@@ -222,7 +220,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
  
   - Other entry points:
     - `benchmark.py` — Single-sample profiling.
-    - Example 1 (threshold decoder, TP across 4 GPUs, LLaDA2-mini))
+    - Example 1 (LLaDA2-mini, threshold decoder, TP across 4 GPUs):
     ```shell
     python benchmarks/benchmark.py \
       --model_name inclusionAI/LLaDA2.0-mini-preview \
@@ -244,7 +242,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
     - `gsm8k_llada`: math reasoning.
     - `mbpp_sanitized_llada`: sanitized Python code generation.
   - For more examples and comprehensive instructions, see [our quickstart guide](evaluations/eval_guide.md).
-  - Currently, the evaluation configuration is only aligned with LLaDA-MoE; lm-eval evaluations for llada2-mini/flash and other models will be updated later.
+  - Currently, the evaluation configuration is only aligned with LLaDA-MoE, `lm-eval` evaluations for llada2-mini/flash and other models will be updated later.
 
 ## Contact us
 - Wechat Group
