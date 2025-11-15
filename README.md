@@ -50,33 +50,15 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 
 dInfer supports multiple diffusion language model variants with different architectures and sizes. Below are the HuggingFace model links and their corresponding implementation files:
 
-### LLaDA2.0 (Mixture-of-Experts)
-
-**Implementation**: [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py)
-
-| Model | Size | HuggingFace Link | Description |
-|-------|------|------------------|-------------|
-| LLaDA2.0-mini-preview | 16B | [inclusionAI/LLaDA2.0-mini-preview](https://huggingface.co/inclusionAI/LLaDA2.0-mini-preview) | MoE dLLM focused on efficient reasoning and tool use |
-| LLaDA2.0-flash-preview | 100B | [inclusionAI/LLaDA2.0-flash-preview](https://huggingface.co/inclusionAI/LLaDA2.0-flash-preview) | Large MoE dLLM targeting advanced code/math reasoning |
-
-### LLaDA-MoE Models (Mixture-of-Experts)
-
-**Implementation**: [LLaDAMoeModelLM](python/dinfer/model/modeling_fused_olmoe.py)
-
-| Model | Size | HuggingFace Link | Description |
-|-------|------|------------------|-------------|
-| LLaDA-MoE-7B-A1B-Base | 7B | [inclusionAI/LLaDA-MoE-7B-A1B-Base](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Base) | Pretrained MoE dLLM |
-| LLaDA-MoE-7B-A1B-Instruct | 7B | [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) | Instruction-tuned MoE variant |
-
-### LLaDA Models (Dense)
-
-**Implementation**: [LLaDAModelLM](python/dinfer/model/modeling_llada.py)
-
-| Model | Size | HuggingFace Link | Description |
-|-------|------|------------------|-------------|
-| LLaDA-8B-Base | 8B | [GSAI-ML/LLaDA-8B-Base](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) | Pretrained dense dLLM |
-| LLaDA-8B-Instruct | 8B | [GSAI-ML/LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) | SFT instruction-following variant |
-| LLaDA-1.5 | 8B | [GSAI-ML/LLaDA-1.5](https://huggingface.co/GSAI-ML/LLaDA-1.5) | LLaDA-8B aligned with VRPO |
+| Model | Size | Implementation | HuggingFace Link |
+|-------|------|----------------|------------------|
+| LLaDA2.0-mini-preview | 16B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-mini-preview](https://huggingface.co/inclusionAI/LLaDA2.0-mini-preview) |
+| LLaDA2.0-flash-preview | 100B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-flash-preview](https://huggingface.co/inclusionAI/LLaDA2.0-flash-preview) |
+| LLaDA-MoE-7B-A1B-Base | 7B | [LLaDAMoeModelLM](python/dinfer/model/modeling_fused_olmoe.py) | [inclusionAI/LLaDA-MoE-7B-A1B-Base](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Base) |
+| LLaDA-MoE-7B-A1B-Instruct | 7B | [LLaDAMoeModelLM](python/dinfer/model/modeling_fused_olmoe.py) | [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) |
+| LLaDA-8B-Base | 8B | [LLaDAModelLM](python/dinfer/model/modeling_llada.py) | [GSAI-ML/LLaDA-8B-Base](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) |
+| LLaDA-8B-Instruct | 8B | [LLaDAModelLM](python/dinfer/model/modeling_llada.py) | [GSAI-ML/LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) |
+| LLaDA-1.5 | 8B | [LLaDAModelLM](python/dinfer/model/modeling_llada.py) | [GSAI-ML/LLaDA-1.5](https://huggingface.co/GSAI-ML/LLaDA-1.5) |
 
 ## Quick Start
 
