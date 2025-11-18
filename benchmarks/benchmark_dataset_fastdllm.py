@@ -11,6 +11,7 @@ from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_co
 from vllm.forward_context import set_forward_context
 import json
 
+# 使用FastDLLM生成函数，而不是扩散模型的多种解码器
 from dinfer.decoding.generate_fastdllm import generate_fastdllm
 from dinfer.model import LLaDAModelLM, LLaDAMoeModelLM
 
@@ -22,10 +23,15 @@ def setup_distributed(rank, world_size):
     print(f'rank={rank}, world size={world_size}')
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
+# bucket_size = 8（而不是32），使用向上取整（而不是向下取整）
 bucket_size = 8
 used_buckets = []
 
 def get_bucket_length(length):
+    """
+    【差异】向上取整到bucket_size的倍数（使用 (length+bucket_size-1)//bucket_size）
+    benchmark_dataset.py 使用向下取整（length//bucket_size）
+    """
     bucket_length = bucket_size*((length+bucket_size-1)//bucket_size)
     if bucket_length not in used_buckets:
         used_buckets.append(bucket_length)
@@ -68,13 +74,16 @@ def cal_bucket_len(args, all_input_ids):
     return padded_gen_lens
 
 def warmup_cudagraph(rank, device, dllm, args):
+    """
+    【差异】此版本的warmup函数未被使用，因为FastDLLM不需要预热CUDA图
+    """
     if rank==0:
         print('warmup')
         print(used_buckets)
         iterator = tqdm.tqdm(used_buckets)
     else:
         iterator = used_buckets
-    for i in iterator:   
+    for i in iterator:
         input_ids = torch.randint(0, 140000, (1, i - args.gen_len), dtype=torch.long, device=device)
         dllm.generate(input_ids, gen_length=args.gen_len, block_length=args.block_length)
 
@@ -87,6 +96,7 @@ def main(world_size, rank, gpu_id, args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     all_input_ids, prompts, questions, ids = load_inputs(args.dataset, tokenizer)
 
+    # 【差异】使用num_parallel参数控制并行度，而不是使用padded_gen_lens
     num_parallel = args.num_parallel
     gen_len = args.gen_len
     block_length=args.block_length
@@ -106,16 +116,19 @@ def main(world_size, rank, gpu_id, args):
         print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
 
         model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+        # 【差异】只支持LLaDAMoeModelLM，没有llada2和llada的分支
         model = LLaDAMoeModelLM(config=model_config).eval()
         model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
         if args.tp_size>1 and args.use_tp:
             print('enabling tp')
             model.tensor_parallel(args.tp_size)
         model = model.to(device)
+        # 【差异】没有torch.compile编译步骤，没有解码器和扩散模型的初始化
 
 
         outputs = []
         total_forward = 0
+        # 【差异】逐个样本处理，而不是按批次处理
         if rank==0:
             iterator = tqdm.trange(len(all_input_ids))
         else:
@@ -126,17 +139,22 @@ def main(world_size, rank, gpu_id, args):
         fpss = []
         total_token = 0
         token_numbers = []
-        for i in iterator:   
+        for i in iterator:
             input_ids = all_input_ids[i]
             inner_start = time.time()
+            # 【差异】使用generate_fastdllm函数，直接返回输出和前向传播次数
+            # 参数包括：use_cache, dual_cache, steps（由num_parallel计算），remasking策略等
             out, nfe = generate_fastdllm(model, input_ids, use_cache=args.cache, dual_cache=args.dual_cache,
-                    steps=gen_len//num_parallel, gen_length=gen_len, block_length=block_length, temperature=0.,
-                    remasking='low_confidence', threshold=args.threshold, mask_id=156895, eos_id=156892, early_stop=False,
+                    steps=gen_len//num_parallel,  # 步数 = 生成长度 / 并行度
+                    gen_length=gen_len, block_length=block_length, temperature=0.,
+                    remasking='low_confidence',  # 重新mask策略
+                    threshold=args.threshold, mask_id=156895, eos_id=156892, early_stop=False,
                     parallel_decoding=args.parallel_decoding)
             inner_stop = time.time()
             sample_time = inner_stop - inner_start
             outputs.append(out)
             total_forward += nfe
+            # 【差异】token计数排除了mask_id(156895)和eos_id(156892)
             token_number = torch.logical_and(out[0, input_ids.shape[1]:]!=156892, out[0, input_ids.shape[1]:]!=156895).sum().cpu().item()
             token_numbers.append(token_number)
             tpf = token_number/nfe
@@ -181,10 +199,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_15t_0827_500B_further_8k_enneal_train_4k_ep3_v7_1e-5/step45567_converted_hf_fusemoe')
     parser.add_argument('--dataset', type=str, default='/mnt/dllm/myx/dumped_prompts/IFEval.json')
-    #parser.add_argument('--dataset', type=str, default='/mnt/dllm/wln/test_prev_tokenized_prompt/humaneval_gen_0shot_20250709')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--num_parallel', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=1)  # 【差异】batch_size参数存在但未使用
+    parser.add_argument('--num_parallel', type=int, default=1)  # 【新增】并行度参数，用于计算steps
     parser.add_argument('--gen_len', type=int, default=1024)
     parser.add_argument('--prefix_look', type=int, default=64)
     parser.add_argument('--after_look', type=int, default=16)
@@ -192,7 +209,7 @@ if __name__ == '__main__':
     parser.add_argument('--threshold', type=float, default=0.95)
     parser.add_argument('--warmup_times', type=int, default=0)
     parser.add_argument('--low_threshold', type=float, default=0.3)
-    parser.add_argument('--parallel_decoding', type=str, default='fastdllm')
+    parser.add_argument('--parallel_decoding', type=str, default='fastdllm')  # 【差异】默认值'fastdllm'
     parser.add_argument('--exp_name', type=str, default='exp')
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--dual_cache', action='store_true')
@@ -206,6 +223,7 @@ if __name__ == '__main__':
     gpus = [int(gpu) for gpu in args.gpu.split(',')]
     args.tp_size = len(gpus)
     args.port_offset = gpus[0]
+    # 【差异】强制启用cache和dual_cache，覆盖命令行参数
     args.cache = True
     args.dual_cache = True
     if len(gpus) == 1:

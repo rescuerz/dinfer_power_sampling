@@ -14,7 +14,7 @@ import json
 from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
 from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockDiffusionLLM
-import random
+import random  # 【新增】用于生成随机端口
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -146,6 +146,7 @@ def main(world_size, rank, gpu_id, args):
 
         else:
             decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=mask_id, eos_id=eos_id)
+        # 【核心差异】创建warmup专用的解码器，threshold=0.5，用于CUDA图预热
         warmup_decoder = ThresholdParallelDecoder(temperature=0, threshold=0.5, mask_id=mask_id, eos_id=eos_id)
         use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
             
@@ -213,6 +214,9 @@ def main(world_size, rank, gpu_id, args):
                 for j in range(len(input_ids)):
                     batch_input_ids[j, :input_ids[j].shape[1]] = input_ids[j].to(device)
                 input_ids = batch_input_ids
+                # 【核心差异】当prefill长度变化时，使用warmup_dllm进行CUDA图预热（执行两次）
+                # 这是sorted版本的关键特性：按长度排序后，相同prefill长度的样本会连续出现
+                # 只在prefill长度变化时才需要重新预热CUDA图
                 if prefill_length != last_prefill_length:
                     if rank==0:
                         print(f'warmup {i}, prefill length: {prefill_length}, sample length: {sorted_input_ids[i].shape[1]}')
@@ -340,6 +344,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_type', type=str, default='llada2')
     parser.add_argument('--config', type=int, default=0)
     args = parser.parse_args()
+    # 【差异】随机生成端口号（30000-60000），范围与sglang不同
     port = random.randint(30000, 60000)
     args.port = str(port)
     
