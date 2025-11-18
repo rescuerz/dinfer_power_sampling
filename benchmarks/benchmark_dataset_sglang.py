@@ -9,10 +9,11 @@ import tqdm
 import json
 import random
 
+# 【差异】使用SGLang框架相关的导入
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.layers.moe import initialize_moe_config
-from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
-from dinfer.decoding.diffusion_runner import ModelRunner
+from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM  # 【差异】SGLang版本的LLaDA2模型
+from dinfer.decoding.diffusion_runner import ModelRunner  # 【新增】模型运行器
 from dinfer import BlockIteratorFactory, KVCacheFactory, BlockDiffusionLLM
 from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM
 
@@ -52,7 +53,7 @@ def load_inputs(dataset, tokenizer):
         ids.append(id)
         prompt = judge_detail['prompt']
         questions.append(prompt)
-        prompt = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt+'<|role_end|><role>ASSISTANT</role>'   
+        prompt = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt+'<|role_end|><role>ASSISTANT</role>'
         prompts.append(prompt)
 
         input_ids = tokenizer(prompt)['input_ids']
@@ -95,13 +96,15 @@ def main(world_size, rank, gpu_id, args):
     dataset_name = args.dataset.split('/')[-1][:-5]
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # 【差异】使用SGLang的分布式模块
     from sglang.srt import distributed
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = args.port
+    os.environ['MASTER_PORT'] = args.port  # 【差异】使用随机生成的端口
     distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
     distributed.initialize_model_parallel(args.tp_size, args.tp_size, 1, backend='nccl')
     print("[Loading model]")
 
+    # 【差异】SGLang特有的初始化流程
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
@@ -116,13 +119,14 @@ def main(world_size, rank, gpu_id, args):
         model_config=model_config,
     )
     initialize_moe_config(server_args)
+    # 【差异】使用LLaDA2SGLangLM模型
     model = LLaDA2SGLangLM(config=model_config, expert_map_path='.').eval()
     torch.set_default_dtype(torch.bfloat16)
     model.load_weights(args.model_name, device=device)
     initialize_moe_config(server_args)
     
-    
     model = model.to(device)
+    # 【差异】计算最大长度并包装为ModelRunner
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
     model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
@@ -137,6 +141,7 @@ def main(world_size, rank, gpu_id, args):
     else:
         decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=156895, eos_id=156892)
     use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
+    # 【差异】KVCacheFactory指定backend='sglang'和max_length
     if args.cache == 'prefix' or args.cache == 'dual':
         cache_factory=KVCacheFactory(args.cache, is_bd_model=args.use_bd, backend='sglang', max_length=max_length)
     else:
@@ -156,11 +161,12 @@ def main(world_size, rank, gpu_id, args):
             else:
                 dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
     else:
+        # 【差异】BlockDiffusionLLM额外参数：maximum_unroll=4, expected_tpf=4, backend='sglang'
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=4, expected_tpf=4, backend='sglang')
 
     batch_size = args.batch_size
     
-
+    # 【差异】按输入长度排序，以优化批处理效率
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     sorted_indices = sorted(range(len(input_lengths)), key=lambda i: input_lengths[i])
 
@@ -180,13 +186,15 @@ def main(world_size, rank, gpu_id, args):
         fpss = []
         total_token = 0
         token_numbers = []
-        total_time = 0
-        for i in iterator:   
-            input_ids = sorted_input_ids[i:i+batch_size]
+        total_time = 0  # 【新增】累计实际推理时间（不包括其他开销）
+        for i in iterator:
+            input_ids = sorted_input_ids[i:i+batch_size]  # 【差异】使用排序后的输入
 
+            # 【新增】计算prefill相关参数（未使用）
             prefill_blocks = input_ids[-1].shape[1] // block_length
             prefill_length = prefill_blocks * block_length
 
+            # 【差异】使用批次中最长序列的长度和对应的生成长度
             max_length = input_ids[-1].shape[1]
             min_padded_length = sorted_padded_gen_lens[i+len(input_ids)-1]
             batch_input_ids= torch.zeros((len(input_ids), max_length), dtype=torch.long, device=device).fill_(156895)
@@ -202,10 +210,10 @@ def main(world_size, rank, gpu_id, args):
             for j in range(input_ids.shape[0]):
                 outputs.append(out[j].unsqueeze(0))
             total_forward += nfe
-            total_time += sample_time
+            total_time += sample_time  # 【差异】累计实际推理时间
             batch_token_number = 0
             for j in range(input_ids.shape[0]):
-                token_number = int((out[j]!=156892).sum() - sorted_input_ids[i+j].shape[1])
+                token_number = int((out[j]!=156892).sum() - sorted_input_ids[i+j].shape[1])  # 【差异】使用sorted_input_ids
                 batch_token_number += token_number
                 token_numbers.append(token_number)
             tpf = batch_token_number/nfe/batch_size
@@ -215,11 +223,12 @@ def main(world_size, rank, gpu_id, args):
             tpss.append(tps)
             fpss.append(fps)
             if rank == 0:
+                # 【差异】打印格式包含sample_time和平均值
                 print(f'[iter {i:4d}]nfe={nfe:4d}, token number={batch_token_number:4d}, sample_time={sample_time:2.4f}, fps={fps:4.2f}({np.mean(fpss):4.2f}),tpf={tpf:2.2f}({np.mean(tpfs):4.2f}), tps={tps:4.2f}({np.mean(tpss):4.2f})')
                 if wi==0 and i<5:
+                    # 【差异】最多打印4个样本
                     for j in range(min(input_ids.shape[0], 4)):
                         answer = cut_eos(out[j, sorted_input_ids[i+j].shape[1]:].unsqueeze(0))[0]
-                        # print(answer)
                         print(f'generated text {j}: {tokenizer.decode(answer, skip_special_tokens=False)}')
             total_token += token_number
 
@@ -228,6 +237,7 @@ def main(world_size, rank, gpu_id, args):
         stop = time.time()
 
 
+    # 【差异】将排序后的结果恢复到原始顺序
     original_order_outputs = [None] * len(all_input_ids)
     original_order_tpfs = [None] * len(all_input_ids)
     original_order_tpss = [None] * len(all_input_ids)
@@ -245,7 +255,7 @@ def main(world_size, rank, gpu_id, args):
     tpfs = original_order_tpfs
     tpss = original_order_tpss
     fpss = original_order_fpss
-    token_numbers = original_order_token_numbers        
+    token_numbers = original_order_token_numbers
 
     if rank==0:
         answers = []
@@ -253,6 +263,7 @@ def main(world_size, rank, gpu_id, args):
             out = outputs[i]
             answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
             answers.append(answer)
+        # 【差异】使用total_time而不是(stop-start)计算FPS和TPS
         print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/total_time}({np.mean(fpss)}), TPS: {total_token/total_time}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
         filename = args.output_dir+'/'+'_'.join([str(item) for item in [args.exp_name, dataset_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look]])+'.jsonl'
         with open (filename, 'w') as f:
@@ -263,6 +274,7 @@ def main(world_size, rank, gpu_id, args):
                 id = ids[i]
                 json.dump({'id':id, 'question':question, 'prompt':prompt, 'answer': answer, 'generated_length': token_numbers[i], 'tpf':tpfs[i//batch_size], 'tps':tpss[i//batch_size], 'fps':fpss[i//batch_size], }, f, indent=4)
                 f.write('\n')
+        # 【差异】results.txt包含更多信息：batch_size, block_length, gpu
         with open('results.txt', 'a+') as f:
             print(args.exp_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look, args.batch_size, args.block_length, args.gpu, total_forward, stop-start, total_token / len(all_input_ids), total_forward/total_time, total_token/total_time, total_token/total_forward, sum(padded_gen_lens)/total_forward, np.mean(fpss), np.mean(tpss), np.mean(tpfs), args.dataset, file=f)
 
@@ -293,9 +305,10 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='/ossfs/workspace/detailed_results_0917')
     parser.add_argument('--use_shift', action='store_true')
     parser.add_argument('--use_bd', action='store_true')
-    parser.add_argument('--model_type', type=str, default='mini')
+    parser.add_argument('--model_type', type=str, default='mini')  # 【差异】默认值'mini'
     parser.add_argument('--config', type=int, default=0)
     args = parser.parse_args()
+    # 【差异】随机生成端口号，避免多进程冲突
     port = random.randint(40000, 60000)
     args.port = str(port)
 
@@ -410,7 +423,7 @@ if __name__ == '__main__':
         args.threshold = 0.95
         args.warmup_times = 0
         args.use_bd=True
-        args.block_length=32
+        args.block_length=32  # 【差异】config 40设置block_length=32
     elif args.config == 41:
         args.cache = 'prefix'
         args.parallel_decoding = 'threshold'
@@ -418,7 +431,7 @@ if __name__ == '__main__':
         args.after_look = 0
         args.threshold = 0.95
         args.warmup_times = 0
-        args.use_bd=True
+        args.use_bd=True  # 【差异】config 41不设置block_length
     procs = []
     print(args)
 

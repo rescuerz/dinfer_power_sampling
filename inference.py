@@ -1,5 +1,6 @@
 import os
 import torch
+import time
 from transformers import AutoTokenizer, AutoConfig
 from vllm import distributed
 from vllm.config import ParallelConfig
@@ -15,7 +16,7 @@ tokenizer = AutoTokenizer.from_pretrained(m, trust_remote_code=True)
 
 print("========== 步骤2: 设备和分布式环境初始化 ==========")
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 device = torch.device('cuda:0')  
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12346'
@@ -58,7 +59,10 @@ input_ids = tokenizer(prompt)['input_ids']
 input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
 print("========== 步骤6: 执行生成 ==========")
+start_time = time.time()
 res = dllm.generate(input_ids, gen_length=1024, block_length=64)
+end_time = time.time()
+print(f"生成耗时: {end_time - start_time:.2f} 秒")
 
 print("========== 步骤7: 解码并输出结果 ==========")
 print(tokenizer.decode(res[0, input_ids.shape[1]:], skip_special_tokens=False))
