@@ -14,90 +14,99 @@ def get_transfer_index_hierarchy_fast_v2(logits, temperature, remasking, mask_in
     else:
         logits_with_noise = logits
 
-    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+    x0 = torch.argmax(logits_with_noise, dim=-1) # [batch, seq_len]
 
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float32), dim=-1)
+        p = F.softmax(logits.to(torch.float32), dim=-1)  # [batch, seq_len, vocab_size]
         x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # [batch, seq_len]
     else:
         raise NotImplementedError(remasking)
     
     x0 = torch.where(mask_index, x0, x)
+    # 只在mask位置保留置信度，非mask位置设为-inf
     confidence = torch.where(mask_index, x0_p, -np.inf)
     
 
     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+
+    # 模式1：固定数量解码
     if  num_transfer_tokens is not None:
         assert threshold is None
         for j in range(confidence.shape[0]):
             _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
             transfer_index[j, select_index] = True
-    
+
+    # 模式2：层级解码（Hierarchy Decoding）
     else:
         for i in range (mask_index.shape[0]):
+            mask_i = mask_index[i].int()  # 当前样本的mask索引
+            conf_i = confidence[i]        # 当前样本的置信度
 
-            mask_i = mask_index[i].int()
-            conf_i = confidence[i]
-
+            # 特殊情况：如果最大置信度低于low_threshold，只转移最高置信度的token
             if low_threshold is not None:
                 max_value, max_index = torch.max(conf_i, dim=0)
                 if max_value < low_threshold:
                     transfer_index [i, max_index] = True
                     continue
 
-
+            # 找出所有连续的mask区间
+            # diff计算相邻位置的差值，1表示区间开始，-1表示区间结束
             diff = torch.diff(torch.cat([mask_i[:1]*0, mask_i, mask_i[-1:]*0]))
-            starts = (diff == 1).nonzero(as_tuple=True)[0]
-            ends = (diff == -1).nonzero(as_tuple=True)[0]
+            starts = (diff == 1).nonzero(as_tuple=True)[0]  # 区间起始位置
+            ends = (diff == -1).nonzero(as_tuple=True)[0]    # 区间结束位置
 
-
+            # 在每个连续mask区间中选择置信度最高的token
             if len(starts) > 0:
                 max_indices = [s + torch.argmax(conf_i[s:e]) for s, e in zip(starts.tolist(), ends.tolist())]
                 transfer_index[i, max_indices] = True
-            
+
+            # 应用低阈值过滤：移除置信度低于low_threshold的token
             if low_threshold is not None:
-                transfer_index [i] = torch.logical_and (transfer_index[i], conf_i > low_threshold) 
-                
+                transfer_index [i] = torch.logical_and (transfer_index[i], conf_i > low_threshold)
+
+        # 应用高阈值：置信度超过threshold的token直接转移（跨所有样本）
         if threshold is not None:
             transfer_index = torch.logical_or(transfer_index, confidence > threshold)
-
 
     return x0, transfer_index
 
 @ torch.no_grad()
-def get_transfer_index_hierarchy_remask(logits, temperature, mask_index, x, num_transfer_tokens,  
+def get_transfer_index_hierarchy_remask(logits, temperature, mask_index, x, num_transfer_tokens,
                                          mask_id, threshold=None,  low_threshold = None, remask_threshold = 0.4):
+    """
+    层级解码策略（带重掩码机制）：对低置信度的已解码token重新掩码
+    """
     if not math.isclose(temperature, 0.0):
         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     else:
         logits_with_noise = logits
 
-    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-
+    x0 = torch.argmax(logits_with_noise, dim=-1) # [batch, seq_len]
 
     p = F.softmax(logits, dim=-1)
-    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # [batch, seq_len]
 
-
+    # 识别需要重掩码的位置
     lower_index = x0_p < remask_threshold
-    remask_index = torch.logical_and (lower_index, torch.logical_not(mask_index))
-    mask_new = torch.logical_or (lower_index, mask_index)
+    remask_index = torch.logical_and (lower_index, torch.logical_not(mask_index))  # 已解码但置信度低的位置
+    mask_new = torch.logical_or (lower_index, mask_index)  # 扩展后的mask区间（原始mask + 重掩码）
 
-    
     confidence = torch.where(mask_new, x0_p, float('-inf'))
-    
+
     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
 
+    # 统计每个样本需要重掩码的token数量
     remask_cnt = remask_index.sum (dim = 1)
 
-    
+    # 模式1：固定数量解码
     if  num_transfer_tokens is not None:
         assert threshold is None
         for j in range(confidence.shape[0]):
             _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
             transfer_index[j, select_index] = True
-    
+
+    # 模式2：层级解码
     else:
         for i in range (mask_new.shape[0]):
 
@@ -120,16 +129,19 @@ def get_transfer_index_hierarchy_remask(logits, temperature, mask_index, x, num_
             if threshold is not None:
                 transfer_index [i] = torch.logical_or(transfer_index [i], conf_i > threshold)
 
+            # 关键：确保转移足够的token来填补重掩码的位置
+            # gap = 需要重掩码的数量 + 1 - 已选择转移的数量
             gap = int((remask_cnt [i] + 1 - transfer_index [i].sum()).item())
             if gap > 0:
-                conf_i [transfer_index [i]] = float('-inf')
+                # 从剩余位置中选择gap个置信度最高的token
+                conf_i [transfer_index [i]] = float('-inf')  # 排除已选择的位置
                 values, indices = torch.topk (conf_i, gap, largest=True, sorted=False)
                 transfer_index [i][indices] = True
-            
-    
+
+    # 处理重掩码：将需要重掩码但不转移的位置设为mask_id
     remask_index = torch.logical_and (remask_index, torch.logical_not (transfer_index))
     x0 [remask_index] = mask_id
-    transfer_index [remask_index] = True
+    transfer_index [remask_index] = True  # 重掩码的位置也标记为转移（因为值被改变了）
 
     return x0, transfer_index
 
