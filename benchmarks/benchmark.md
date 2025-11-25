@@ -99,6 +99,17 @@ python benchmarks/benchmark_dataset.py \
   --warmup_times 4 \
   --cont_weight 0.3
 
+python benchmarks/benchmark_dataset_mcmc.py \
+  --model_name /home/zhounan/models/inclusionAI/LLaDA-MoE-7B-A1B-Instruct-fused \
+  --model_type llada_moe \
+  --dataset datasets/gsm8k/compare_data.json \
+  --gen_len 1024 \
+  --block_length 64 \
+  --gpu 1 \
+  --output_dir runs/llada_moe_mcmc_threshold \
+  --parallel_decoding mcmc_threshold \
+  --threshold 0.8
+
 # LLaDA2-flash 数据集测试（手动配置参数）
 python benchmarks/benchmark_dataset.py \
   --model_name inclusionAI/LLaDA2.0-flash-preview \
