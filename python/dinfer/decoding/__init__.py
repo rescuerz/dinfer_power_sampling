@@ -7,4 +7,4 @@ from .generate_uniform import (
     MCMCProposalGenerator, MCMCRefinementRunner
 )
 
-from .utils import BlockIteratorFactory, KVCacheFactory, add_gumbel_noise_power
+from .utils import BlockIteratorFactory, KVCacheFactory, KVCacheSnapshot, add_gumbel_noise_power

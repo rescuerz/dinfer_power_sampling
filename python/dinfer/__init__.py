@@ -22,4 +22,4 @@ from .decoding.generate_uniform import IterSmoothDiffusionLLM, IterSmoothWithVic
 
 from .decoding.serving import DiffusionLLMServing, SamplingParams
 
-from .decoding.utils import BlockIteratorFactory, KVCacheFactory
+from .decoding.utils import BlockIteratorFactory, KVCacheFactory, KVCacheSnapshot

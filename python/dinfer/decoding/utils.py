@@ -429,6 +429,92 @@ class KVCache:
         return keys, values
 
 
+class KVCacheSnapshot:
+    """KV Cache 快照，用于 MCMC 回滚机制
+    
+    在 MCMC 精炼过程中，如果提议被拒绝，需要回滚 KV Cache 到原始状态。
+    此类保存指定区域的 KV Cache 副本，支持快速恢复。
+    
+    Parameters
+    ----------
+    block_start : int
+        需要快照的区域起始位置
+    block_end : int
+        需要快照的区域结束位置
+    """
+    
+    def __init__(self, block_start, block_end):
+        self.block_start = block_start
+        self.block_end = block_end
+        self.snapshot_data = None  # 保存的 KV 数据
+        self._saved = False
+    
+    def save(self, kv_cache_manager):
+        """保存当前 KV Cache 状态
+        
+        Parameters
+        ----------
+        kv_cache_manager : DiffusionKVCacheManager
+            KV Cache 管理器
+        """
+        if kv_cache_manager is None or kv_cache_manager.past_key_values is None:
+            self.snapshot_data = None
+            self._saved = False
+            return
+        
+        # 确保 KV Cache 已经整合为张量格式
+        kv_cache_manager.past_key_values.consolidate()
+        
+        # 只保存需要回滚的区域 [block_start, block_end)
+        # KVCache._data 形状: [num_layers, 2, batch_size, num_heads, seq_len, hidden_dim]
+        # 使用 clone() 确保是深拷贝
+        kv_data = kv_cache_manager.past_key_values._data
+        
+        # 检查边界
+        seq_len = kv_data.shape[4]
+        actual_end = min(self.block_end, seq_len)
+        actual_start = min(self.block_start, seq_len)
+        
+        if actual_start >= actual_end:
+            self.snapshot_data = None
+            self._saved = False
+            return
+        
+        self.snapshot_data = kv_data[:, :, :, :, actual_start:actual_end, :].clone()
+        self._saved = True
+    
+    def restore(self, kv_cache_manager):
+        """恢复 KV Cache 到快照状态
+        
+        Parameters
+        ----------
+        kv_cache_manager : DiffusionKVCacheManager
+            KV Cache 管理器
+        """
+        if not self._saved or self.snapshot_data is None:
+            return
+        
+        if kv_cache_manager is None or kv_cache_manager.past_key_values is None:
+            return
+        
+        # 将快照数据写回 KV Cache
+        kv_data = kv_cache_manager.past_key_values._data
+        seq_len = kv_data.shape[4]
+        actual_end = min(self.block_end, seq_len)
+        actual_start = min(self.block_start, seq_len)
+        
+        if actual_start >= actual_end:
+            return
+        
+        # 恢复快照数据
+        kv_cache_manager.past_key_values._data[:, :, :, :, actual_start:actual_end, :] = self.snapshot_data
+    
+    @property
+    def is_saved(self):
+        """检查是否已保存快照"""
+        return self._saved
+
+
 class DiffusionKVCacheManager:
     """ KV-cache for diffusion LLM.
 

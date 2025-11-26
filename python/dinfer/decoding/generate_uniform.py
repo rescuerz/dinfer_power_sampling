@@ -1187,6 +1187,10 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         Power parameter α for target distribution p^α (default: 4.0)
     mcmc_temperature : float
         Temperature for proposal distribution (default: 0.0)
+    mcmc_use_kv_cache : bool
+        Whether to use KV Cache acceleration in MCMC proposal generation (default: True)
+        When enabled, proposal generation will reuse KV Cache from previous computations,
+        and supports snapshot/rollback mechanism for accept/reject decisions.
     tokenizer : Tokenizer, optional
         Tokenizer for verbose output
     verbose : bool
@@ -1195,6 +1199,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
     def __init__(self, model, decoder, iterator_factory,
                  enable_mcmc=True, n_mcmc_steps=5,
                  mcmc_alpha=4.0, mcmc_temperature=0.0,
+                 mcmc_use_kv_cache=True,
                  tokenizer=None, verbose=False,
                  early_stop=True, cache_factory=None, 
                  maximum_unroll=4, expected_tpf=8, **kwargs):
@@ -1209,6 +1214,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         self.n_mcmc_steps = n_mcmc_steps
         self.mcmc_alpha = mcmc_alpha
         self.mcmc_temperature = mcmc_temperature
+        self.mcmc_use_kv_cache = mcmc_use_kv_cache
         self.tokenizer = tokenizer
         self.verbose = verbose
         
@@ -1229,7 +1235,8 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                 model=model,
                 decoder=decoder,
                 mcmc_alpha=mcmc_alpha,
-                mcmc_temperature=mcmc_temperature
+                mcmc_temperature=mcmc_temperature,
+                use_kv_cache=mcmc_use_kv_cache
             )
             self.mcmc_runner = MCMCRefinementRunner(
                 proposal_generator=self.proposal_generator,
@@ -1627,19 +1634,26 @@ class MCMCProposalGenerator:
         Power parameter α for target distribution p^α
     mcmc_temperature : float
         Temperature for Gumbel noise sampling
+    use_kv_cache : bool
+        Whether to use KV Cache acceleration in proposal generation (default: True)
     """
     
-    def __init__(self, model, decoder, mcmc_alpha=4.0, mcmc_temperature=0.0):
+    def __init__(self, model, decoder, mcmc_alpha=4.0, mcmc_temperature=0.0, use_kv_cache=True):
         self.model = model
         self.decoder = decoder
         self.mcmc_alpha = mcmc_alpha
         self.mcmc_temperature = mcmc_temperature
+        self.use_kv_cache = use_kv_cache
         self.num_forwards = 0
     
     def generate(self, x_current, idx, block_end, confidences_norm, confidences_unnorm, 
                  kv_cache=None, verbose=False, tokenizer=None):
         """
-        从 idx 位置开始重新生成序列。
+        从 idx 位置开始重新生成序列，支持 KV Cache 加速。
+        
+        KV Cache 使用策略:
+        1. 位置 [0, idx) 的 KV 可以复用（这部分序列没有变化）
+        2. 位置 [idx, block_end) 需要重新计算
         
         Parameters
         ----------
@@ -1653,8 +1667,8 @@ class MCMCProposalGenerator:
             当前归一化置信度
         confidences_unnorm : torch.Tensor
             当前非归一化置信度
-        kv_cache : KVCache, optional
-            KV Cache (当前未使用，预留接口)
+        kv_cache : DiffusionKVCacheManager, optional
+            KV Cache 管理器，用于加速前向传播
         verbose : bool
             是否打印调试信息
         tokenizer : Tokenizer, optional
@@ -1683,15 +1697,48 @@ class MCMCProposalGenerator:
         block_mask_index = (block == self.decoder.mask_id)
         steps = (block == self.decoder.mask_id).sum().item()
         
+        # 检查是否可以使用 KV Cache
+        # 需要同时满足：1) 启用了 KV Cache 2) kv_cache 不为 None 3) past_key_values 已初始化
+        use_kv_cache = (self.use_kv_cache and 
+                        kv_cache is not None and 
+                        kv_cache.past_key_values is not None)
+        
         if verbose and tokenizer is not None:
-            print(f"[MCMCProposalGenerator] Starting denoising from idx={idx} to {block_end}, steps={steps}")
+            print(f"[MCMCProposalGenerator] Starting denoising from idx={idx} to {block_end}, "
+                  f"steps={steps}, use_kv_cache={use_kv_cache} (enabled={self.use_kv_cache})")
         
         if steps > 0:
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+            block_length = block_end - idx
             
             for i in range(steps):
-                # Forward pass (no KV cache for simplicity - can be optimized later)
-                logits = self.model(x_prop.data).logits[:, idx:block_end]
+                # Forward pass with optional KV Cache
+                if use_kv_cache:
+                    # 使用 KV Cache 加速
+                    past_key_values, replace_position = kv_cache.get_key_values(idx, block_end)
+                    
+                    if kv_cache.cache_type == 'prefix':
+                        # 前缀缓存模式：从 idx 开始的所有 token
+                        output = self.model(
+                            x_prop.data[:, idx:],
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            replace_position=replace_position
+                        )
+                        logits = output.logits[:, :block_length]
+                    else:
+                        # 双向缓存模式：只处理当前块
+                        output = self.model(
+                            x_prop.data[:, idx:block_end],
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            replace_position=replace_position
+                        )
+                        logits = output.logits
+                else:
+                    # 无 KV Cache，完整前向传播
+                    logits = self.model(x_prop.data).logits[:, idx:block_end]
+                
                 self.num_forwards += 1
                 
                 # Compute dual log probabilities
@@ -1795,11 +1842,20 @@ class MCMCRefinementRunner:
                 print(f"[MCMC] Block [{block_loc.start}, {block_loc.end}) is entirely in prompt region, skipping")
             return x, confidences_norm, confidences_unnorm, 1.0
         
+        # 导入 KVCacheSnapshot（用于快照/回滚）
+        from .utils import KVCacheSnapshot
+        
         for mcmc_step in range(self.n_mcmc_steps):
             # Step 1: 随机选择重采样位置 (必须在生成区域内)
             idx = random.randint(effective_block_start, block_loc.end - 1)
             
-            # Step 2: 生成提议序列
+            # Step 2: 创建 KV Cache 快照（如果使用 KV Cache）
+            snapshot = None
+            if kv_cache is not None:
+                snapshot = KVCacheSnapshot(idx, block_loc.end)
+                snapshot.save(kv_cache)
+            
+            # Step 3: 生成提议序列（可能会更新 KV Cache）
             x_prop, conf_norm_prop, conf_unnorm_prop = self.proposal_generator.generate(
                 x, idx, block_loc.end, 
                 confidences_norm, confidences_unnorm,
@@ -1807,7 +1863,7 @@ class MCMCRefinementRunner:
                 verbose=verbose, tokenizer=tokenizer
             )
             
-            # Step 3: 计算 MH 接受率（传入 prompt_length 以正确处理边界情况）
+            # Step 4: 计算 MH 接受率（传入 prompt_length 以正确处理边界情况）
             log_r = self._compute_log_acceptance_ratio(
                 confidences_norm, confidences_unnorm,
                 conf_norm_prop, conf_unnorm_prop,
@@ -1816,7 +1872,7 @@ class MCMCRefinementRunner:
                 verbose=verbose
             )
             
-            # Step 4: 接受/拒绝决策
+            # Step 5: 接受/拒绝决策
             accept_prob = min(1.0, np.exp(min(log_r, 0.0)))
             accepted = np.random.rand() < accept_prob
             
@@ -1825,6 +1881,7 @@ class MCMCRefinementRunner:
                       f"log_r={log_r:.4f}, accept_prob={accept_prob:.4f}, accepted={accepted}")
             
             if accepted:
+                # 接受提议：保留新的 x 和 KV Cache（不需要回滚）
                 acceptances += 1
                 x = x_prop
                 # 只更新重新采样区域的置信度
@@ -1836,6 +1893,12 @@ class MCMCRefinementRunner:
                     decoded = tokenizer.batch_decode(current_output, skip_special_tokens=True)
                     print(f"[ACCEPTED] New sequence: {decoded}")
             else:
+                # 拒绝提议：回滚 KV Cache 到快照状态
+                if snapshot is not None and snapshot.is_saved:
+                    snapshot.restore(kv_cache)
+                    if verbose:
+                        print(f"[REJECTED] KV Cache restored to snapshot")
+                
                 if verbose and tokenizer is not None:
                     current_output = x.data[:, prompt_length:]
                     decoded = tokenizer.batch_decode(current_output, skip_special_tokens=True)
