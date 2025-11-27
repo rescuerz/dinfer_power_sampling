@@ -6,6 +6,7 @@ Tests the complete workflow:
 2. Token generation with MCMC refinement
 3. Confidence tracking across blocks
 4. MCMC acceptance rates
+5. Compatibility with BlockWiseDiffusionLLM
 
 Run with: python tests/test_mcmc_integration.py
 """
@@ -21,8 +22,14 @@ from unittest.mock import Mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from dinfer.decoding.utils import TokenArray, BlockIteratorFactory
-from dinfer.decoding.generate_uniform import BlockMCMCDiffusionLLM
-from dinfer.decoding.parallel_strategy import MCMCThresholdParallelDecoder
+from dinfer.decoding.generate_uniform import (
+    BlockMCMCDiffusionLLM,
+    BlockWiseDiffusionLLM,
+)
+from dinfer.decoding.parallel_strategy import (
+    MCMCThresholdParallelDecoder,
+    ThresholdParallelDecoder,
+)
 
 BlockLoc = namedtuple('BlockLoc', ['start', 'end'])
 
@@ -180,8 +187,8 @@ def test_confidence_tracking():
 
 
 def test_mcmc_disabled():
-    """Test generation with MCMC disabled"""
-    print("\n=== Test: MCMC Disabled ===")
+    """Test generation with MCMC disabled (degraded mode)"""
+    print("\n=== Test: MCMC Disabled (Degraded Mode) ===")
     
     try:
         vocab_size = 100
@@ -221,6 +228,81 @@ def test_mcmc_disabled():
         
     except Exception as e:
         print(f"  ✗ MCMC disabled FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_compatibility_with_blockwise():
+    """Test that degraded mode produces similar behavior to BlockWiseDiffusionLLM"""
+    print("\n=== Test: Compatibility with BlockWiseDiffusionLLM ===")
+    
+    try:
+        vocab_size = 100
+        # Use same seed for reproducibility
+        torch.manual_seed(42)
+        model1 = SimpleModel(vocab_size=vocab_size, device=DEVICE)
+        
+        torch.manual_seed(42)
+        model2 = SimpleModel(vocab_size=vocab_size, device=DEVICE)
+        
+        decoder1 = ThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        decoder2 = ThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        iterator_factory1 = BlockIteratorFactory(True)
+        iterator_factory2 = BlockIteratorFactory(True)
+        
+        # Create BlockMCMCDiffusionLLM in degraded mode
+        mcmc_dllm = BlockMCMCDiffusionLLM(
+            model=model1,
+            decoder=decoder1,
+            iterator_factory=iterator_factory1,
+            enable_mcmc=False,
+            verbose=False
+        )
+        
+        # Create BlockWiseDiffusionLLM
+        blockwise_dllm = BlockWiseDiffusionLLM(
+            model=model2,
+            decoder=decoder2,
+            iterator_factory=iterator_factory2
+        )
+        
+        prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+        gen_length = 10
+        block_length = 5
+        
+        # Generate with both
+        torch.manual_seed(123)
+        output1 = mcmc_dllm.generate(prompt.clone(), gen_length=gen_length, block_length=block_length)
+        
+        torch.manual_seed(123)
+        output2 = blockwise_dllm.generate(prompt.clone(), gen_length=gen_length, block_length=block_length)
+        
+        print(f"  BlockMCMC (degraded) output: {output1.tolist()}")
+        print(f"  BlockWise output: {output2.tolist()}")
+        print(f"  BlockMCMC forwards: {mcmc_dllm.num_forwards}")
+        print(f"  BlockWise forwards: {blockwise_dllm.num_forwards}")
+        
+        # Both should produce valid outputs
+        assert output1.shape == output2.shape, "Output shapes should match"
+        
+        print("  ✓ Compatibility test PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Compatibility test FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -373,6 +455,50 @@ def test_different_alpha_values():
         return False
 
 
+def test_proposal_alpha():
+    """Test generation with different proposal_alpha values"""
+    print("\n=== Test: Proposal Alpha Values ===")
+    
+    try:
+        vocab_size = 100
+        model = SimpleModel(vocab_size=vocab_size, device=DEVICE)
+        
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        iterator_factory = BlockIteratorFactory(True)
+        
+        for proposal_alpha in [1.0, 2.0, 4.0]:
+            dllm = BlockMCMCDiffusionLLM(
+                model=model,
+                decoder=decoder,
+                iterator_factory=iterator_factory,
+                enable_mcmc=True,
+                n_mcmc_steps=1,
+                mcmc_alpha=4.0,
+                proposal_alpha=proposal_alpha,
+                verbose=False
+            )
+            
+            prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+            output = dllm.generate(prompt, gen_length=10, block_length=5)
+            
+            print(f"  proposal_alpha={proposal_alpha}: output shape {output.shape}")
+        
+        print("  ✓ Proposal alpha values PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Proposal alpha values FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_batch_size_one():
     """Test with batch size 1 (most common case)"""
     print("\n=== Test: Batch Size One ===")
@@ -419,6 +545,105 @@ def test_batch_size_one():
         return False
 
 
+def test_degraded_mode_with_shift():
+    """Test degraded mode with shift decoding"""
+    print("\n=== Test: Degraded Mode with Shift ===")
+    
+    try:
+        vocab_size = 100
+        model = SimpleModel(vocab_size=vocab_size, device=DEVICE)
+        
+        decoder = ThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        iterator_factory = BlockIteratorFactory(True)
+        
+        # Create MCMC LLM with MCMC disabled and shift enabled
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=False,
+            use_shift=True,
+            verbose=False
+        )
+        
+        prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+        gen_length = 10
+        block_length = 5
+        
+        # This should work without errors
+        output = dllm.generate(prompt, gen_length=gen_length, block_length=block_length)
+        
+        print(f"  Generated output shape: {output.shape}")
+        print(f"  use_shift: {dllm.use_shift}")
+        
+        assert dllm.use_shift == True, "use_shift should be True"
+        assert dllm.mcmc_runner is None, "MCMC runner should be None"
+        
+        print("  ✓ Degraded mode with shift PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Degraded mode with shift FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_mcmc_n_steps_zero():
+    """Test with n_mcmc_steps=0 (no MCMC refinement)"""
+    print("\n=== Test: n_mcmc_steps=0 ===")
+    
+    try:
+        vocab_size = 100
+        model = SimpleModel(vocab_size=vocab_size, device=DEVICE)
+        
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        iterator_factory = BlockIteratorFactory(True)
+        
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=True,
+            n_mcmc_steps=0,  # No MCMC refinement
+            mcmc_alpha=4.0,
+            verbose=False
+        )
+        
+        prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+        gen_length = 10
+        block_length = 5
+        
+        output = dllm.generate(prompt, gen_length=gen_length, block_length=block_length)
+        
+        print(f"  Generated output shape: {output.shape}")
+        print(f"  n_mcmc_steps: {dllm.n_mcmc_steps}")
+        
+        # Should still work, just no MCMC refinement
+        assert output.shape[1] > 0, "Output should have tokens"
+        
+        print("  ✓ n_mcmc_steps=0 PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ n_mcmc_steps=0 FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 # ============================================================================
 # Run Integration Tests
 # ============================================================================
@@ -436,10 +661,14 @@ def run_integration_tests():
     results.append(("Basic Generation", test_basic_generation()))
     results.append(("Confidence Tracking", test_confidence_tracking()))
     results.append(("MCMC Disabled", test_mcmc_disabled()))
+    results.append(("Compatibility with BlockWise", test_compatibility_with_blockwise()))
     results.append(("Multiple Blocks", test_multiple_blocks()))
     results.append(("Forward Count", test_forward_count()))
     results.append(("Different Alpha Values", test_different_alpha_values()))
+    results.append(("Proposal Alpha Values", test_proposal_alpha()))
     results.append(("Batch Size One", test_batch_size_one()))
+    results.append(("Degraded Mode with Shift", test_degraded_mode_with_shift()))
+    results.append(("n_mcmc_steps=0", test_mcmc_n_steps_zero()))
     
     # Summary
     print("\n" + "="*60)

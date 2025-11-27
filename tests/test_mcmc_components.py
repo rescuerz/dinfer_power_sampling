@@ -7,6 +7,7 @@ Tests:
 - MCMCProposalGenerator
 - MCMCRefinementRunner
 - BlockMCMCDiffusionLLM
+- Compatibility with BlockWiseDiffusionLLM
 
 Run with: python tests/test_mcmc_components.py
 """
@@ -28,8 +29,15 @@ from dinfer.decoding.generate_uniform import (
     MCMCProposalGenerator,
     MCMCRefinementRunner,
     BlockMCMCDiffusionLLM,
+    BlockWiseDiffusionLLM,
+    BaseDiffusionIteration,
+    ShiftDiffusionIteration,
+    BlockRunner,
 )
-from dinfer.decoding.parallel_strategy import MCMCThresholdParallelDecoder
+from dinfer.decoding.parallel_strategy import (
+    MCMCThresholdParallelDecoder,
+    ThresholdParallelDecoder,
+)
 
 # Named tuple for block location
 BlockLoc = namedtuple('BlockLoc', ['start', 'end'])
@@ -103,7 +111,7 @@ class TestMCMCDiffusionIteration:
         assert torch.all(iteration.confidences_norm == -np.inf)
         assert torch.all(iteration.confidences_unnorm == -np.inf)
         assert iteration.iter_no == 0
-    
+
     def test_forward_no_cache(self):
         """Test forward pass without KV cache"""
         model = MockModel(vocab_size=100, device=DEVICE)
@@ -161,7 +169,7 @@ class TestMCMCDiffusionIteration:
         
         assert iteration.num_forwards == 3
         assert iteration.iter_no == 3
-    
+
     def test_different_alpha_values(self):
         """Test with different mcmc_alpha values"""
         model = MockModel(vocab_size=100, device=DEVICE)
@@ -212,8 +220,6 @@ class TestMCMCBlockRunner:
     
     def test_inheritance(self):
         """Test that MCMCBlockRunner inherits from BlockRunner"""
-        from dinfer.decoding.generate_uniform import BlockRunner
-        
         iteration = MCMCDiffusionIteration()
         runner = MCMCBlockRunner(iteration, True, 4, 8)
         
@@ -248,6 +254,23 @@ class TestMCMCProposalGenerator:
         assert generator.mcmc_temperature == 0.0
         assert generator.num_forwards == 0
     
+    def test_init_with_proposal_alpha(self):
+        """Test initialization with proposal_alpha parameter"""
+        model = MockModel(device=DEVICE)
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        
+        generator = MCMCProposalGenerator(
+            model=model,
+            decoder=decoder,
+            mcmc_alpha=4.0,
+            proposal_alpha=2.0
+        )
+        
+        assert generator.proposal_alpha == 2.0
+    
     def test_generate_basic(self):
         """Test basic proposal generation"""
         model = MockModel(vocab_size=100, device=DEVICE)
@@ -277,19 +300,24 @@ class TestMCMCProposalGenerator:
         # Generate proposal
         idx = 7
         block_end = 10
-        x_prop, conf_norm_prop, conf_unnorm_prop = generator.generate(
+        result = generator.generate(
             x_current, idx, block_end, conf_norm, conf_unnorm
         )
         
-        # Verify
+        # Verify - should return 5 values now (including reverse confidences)
+        assert len(result) == 5
+        x_prop, conf_norm_prop, conf_unnorm_prop, reverse_conf_norm, reverse_conf_unnorm = result
+        
         assert x_prop is not None
         assert conf_norm_prop is not None
         assert conf_unnorm_prop is not None
+        assert reverse_conf_norm is not None
+        assert reverse_conf_unnorm is not None
         assert x_prop.data.shape == x_current.data.shape
         # Positions before idx should be unchanged
         assert torch.all(x_prop.data[:, :idx] == x_current.data[:, :idx])
         assert generator.num_forwards > 0
-    
+
     def test_generate_full_block(self):
         """Test proposal generation for full block"""
         model = MockModel(vocab_size=100, device=DEVICE)
@@ -310,10 +338,11 @@ class TestMCMCProposalGenerator:
         # Generate from start of block
         idx = 5
         block_end = 10
-        x_prop, conf_norm_prop, conf_unnorm_prop = generator.generate(
+        result = generator.generate(
             x_current, idx, block_end, conf_norm, conf_unnorm
         )
         
+        x_prop = result[0]
         assert x_prop is not None
         # Prompt should be unchanged
         assert torch.all(x_prop.data[:, :5] == x_current.data[:, :5])
@@ -355,20 +384,20 @@ class TestMCMCRefinementRunner:
         runner = MCMCRefinementRunner(generator, n_mcmc_steps=5)
         
         # Create test confidence tensors
-        conf_norm_cur = torch.tensor([[-1.0, -2.0, -3.0]], device=DEVICE)
-        conf_unnorm_cur = torch.tensor([[-0.5, -1.0, -1.5]], device=DEVICE)
-        conf_norm_prop = torch.tensor([[-1.5, -2.5, -2.0]], device=DEVICE)
-        conf_unnorm_prop = torch.tensor([[-0.8, -1.2, -1.0]], device=DEVICE)
+        target_unnorm_cur = torch.tensor([[-0.5, -1.0, -1.5]], device=DEVICE)
+        target_unnorm_prop = torch.tensor([[-0.8, -1.2, -1.0]], device=DEVICE)
+        proposal_forward = torch.tensor([[-1.0, -2.0, -3.0]], device=DEVICE)
+        proposal_reverse = torch.tensor([[-1.5, -2.5, -2.0]], device=DEVICE)
         
         log_r = runner._compute_log_acceptance_ratio(
-            conf_norm_cur, conf_unnorm_cur,
-            conf_norm_prop, conf_unnorm_prop,
+            target_unnorm_cur, target_unnorm_prop,
+            proposal_forward, proposal_reverse,
             idx=0, block_end=3
         )
         
         # Verify it returns a finite number
         assert np.isfinite(log_r)
-    
+
     def test_acceptance_ratio_symmetry(self):
         """Test that swapping current and proposal inverts the ratio"""
         model = MockModel(device=DEVICE)
@@ -380,16 +409,19 @@ class TestMCMCRefinementRunner:
         generator = MCMCProposalGenerator(model, decoder)
         runner = MCMCRefinementRunner(generator, n_mcmc_steps=5)
         
-        conf_norm_a = torch.tensor([[-1.0, -2.0]], device=DEVICE)
-        conf_unnorm_a = torch.tensor([[-0.5, -1.0]], device=DEVICE)
-        conf_norm_b = torch.tensor([[-1.5, -2.5]], device=DEVICE)
-        conf_unnorm_b = torch.tensor([[-0.8, -1.2]], device=DEVICE)
+        # Create symmetric test case
+        target_a = torch.tensor([[-0.5, -1.0]], device=DEVICE)
+        target_b = torch.tensor([[-0.8, -1.2]], device=DEVICE)
+        q_forward = torch.tensor([[-1.0, -2.0]], device=DEVICE)
+        q_reverse = torch.tensor([[-1.5, -2.5]], device=DEVICE)
         
+        # log r(a->b) = log p(b) + log q(a|b) - log p(a) - log q(b|a)
         log_r_ab = runner._compute_log_acceptance_ratio(
-            conf_norm_a, conf_unnorm_a, conf_norm_b, conf_unnorm_b, 0, 2
+            target_a, target_b, q_forward, q_reverse, 0, 2
         )
+        # log r(b->a) = log p(a) + log q(b|a) - log p(b) - log q(a|b)
         log_r_ba = runner._compute_log_acceptance_ratio(
-            conf_norm_b, conf_unnorm_b, conf_norm_a, conf_unnorm_a, 0, 2
+            target_b, target_a, q_reverse, q_forward, 0, 2
         )
         
         # log_r_ab + log_r_ba should be approximately 0
@@ -451,6 +483,32 @@ class TestBlockMCMCDiffusionLLM:
         assert dllm.enable_mcmc == False
         assert dllm.proposal_generator is None
         assert dllm.mcmc_runner is None
+        # Should use BaseDiffusionIteration when enable_mcmc=False and use_shift=False
+        assert isinstance(dllm.diff_iteration, BaseDiffusionIteration)
+        assert isinstance(dllm.block_decoder, BlockRunner)
+
+    def test_init_with_shift_mode(self):
+        """Test initialization with shift mode (enable_mcmc=False, use_shift=True)"""
+        model = MockModel(device=DEVICE)
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=False,
+            use_shift=True
+        )
+        
+        assert dllm.enable_mcmc == False
+        assert dllm.use_shift == True
+        # Should use ShiftDiffusionIteration when enable_mcmc=False and use_shift=True
+        assert isinstance(dllm.diff_iteration, ShiftDiffusionIteration)
+        assert isinstance(dllm.block_decoder, BlockRunner)
     
     def test_num_forwards_property(self):
         """Test num_forwards property"""
@@ -470,6 +528,219 @@ class TestBlockMCMCDiffusionLLM:
         
         # Initially should be 0
         assert dllm.num_forwards == 0
+    
+    def test_proposal_alpha_parameter(self):
+        """Test proposal_alpha parameter is correctly passed"""
+        model = MockModel(device=DEVICE)
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=True,
+            proposal_alpha=2.0
+        )
+        
+        assert dllm.proposal_alpha == 2.0
+        assert dllm.proposal_generator.proposal_alpha == 2.0
+
+
+# ============================================================================
+# Compatibility Tests
+# ============================================================================
+
+class TestBlockMCMCCompatibility:
+    """Tests for BlockMCMCDiffusionLLM compatibility with BlockWiseDiffusionLLM"""
+    
+    def test_degraded_mode_uses_same_components(self):
+        """Test that degraded mode uses same components as BlockWiseDiffusionLLM"""
+        model = MockModel(device=DEVICE)
+        decoder = ThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        # Create BlockMCMCDiffusionLLM in degraded mode
+        mcmc_dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=False,
+            use_shift=False
+        )
+        
+        # Create BlockWiseDiffusionLLM
+        blockwise_dllm = BlockWiseDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            use_shift=False
+        )
+        
+        # Both should use BaseDiffusionIteration
+        assert type(mcmc_dllm.diff_iteration) == type(blockwise_dllm.diff_iteration)
+        # Both should use BlockRunner
+        assert type(mcmc_dllm.block_decoder) == type(blockwise_dllm.block_decoder)
+
+    def test_degraded_mode_with_shift_uses_same_components(self):
+        """Test that degraded mode with shift uses same components as BlockWiseDiffusionLLM with shift"""
+        model = MockModel(device=DEVICE)
+        decoder = ThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        # Create BlockMCMCDiffusionLLM in degraded mode with shift
+        mcmc_dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=False,
+            use_shift=True
+        )
+        
+        # Create BlockWiseDiffusionLLM with shift
+        blockwise_dllm = BlockWiseDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            use_shift=True
+        )
+        
+        # Both should use ShiftDiffusionIteration
+        assert type(mcmc_dllm.diff_iteration) == type(blockwise_dllm.diff_iteration)
+        # Both should use BlockRunner
+        assert type(mcmc_dllm.block_decoder) == type(blockwise_dllm.block_decoder)
+    
+    def test_mcmc_mode_uses_mcmc_components(self):
+        """Test that MCMC mode uses MCMC-specific components"""
+        model = MockModel(device=DEVICE)
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=True
+        )
+        
+        # Should use MCMC-specific components
+        assert isinstance(dllm.diff_iteration, MCMCDiffusionIteration)
+        assert isinstance(dllm.block_decoder, MCMCBlockRunner)
+        assert isinstance(dllm.proposal_generator, MCMCProposalGenerator)
+        assert isinstance(dllm.mcmc_runner, MCMCRefinementRunner)
+    
+    def test_inheritance_from_blockwise(self):
+        """Test that BlockMCMCDiffusionLLM inherits from BlockWiseDiffusionLLM"""
+        model = MockModel(device=DEVICE)
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9, threshold=0.9,
+            mask_id=99, eos_id=98
+        )
+        iterator_factory = BlockIteratorFactory(True)
+        
+        dllm = BlockMCMCDiffusionLLM(
+            model=model,
+            decoder=decoder,
+            iterator_factory=iterator_factory,
+            enable_mcmc=True
+        )
+        
+        assert isinstance(dllm, BlockWiseDiffusionLLM)
+
+
+# ============================================================================
+# MCMCThresholdParallelDecoder Tests
+# ============================================================================
+
+class TestMCMCThresholdParallelDecoder:
+    """Tests for MCMCThresholdParallelDecoder class"""
+    
+    def test_init(self):
+        """Test initialization"""
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        assert decoder.temperature == 0.9
+        assert decoder.threshold == 0.9
+        assert decoder.mask_id == 99
+        assert decoder.eos_id == 98
+    
+    def test_inheritance(self):
+        """Test that MCMCThresholdParallelDecoder inherits from ThresholdParallelDecoder"""
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        assert isinstance(decoder, ThresholdParallelDecoder)
+
+    def test_decode_returns_confidences(self):
+        """Test that decode returns confidence tensors"""
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        # Create test data
+        batch_size, seq_len, vocab_size = 1, 10, 100
+        logits = torch.randn(batch_size, 5, vocab_size, device=DEVICE)
+        
+        prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+        x = TokenArray(prompt, gen_length=5, mask_id=99, eos_id=98, device=DEVICE)
+        
+        # Decode
+        conf_norm, conf_unnorm = decoder.decode(
+            logits, block_start=5, block_end=10, x=x, mcmc_alpha=4.0
+        )
+        
+        assert conf_norm is not None
+        assert conf_unnorm is not None
+        assert conf_norm.shape == (1, 5)
+        assert conf_unnorm.shape == (1, 5)
+    
+    def test_decode_with_proposal_alpha(self):
+        """Test decode with proposal_alpha parameter"""
+        decoder = MCMCThresholdParallelDecoder(
+            temperature=0.9,
+            threshold=0.9,
+            mask_id=99,
+            eos_id=98
+        )
+        
+        batch_size, seq_len, vocab_size = 1, 10, 100
+        logits = torch.randn(batch_size, 5, vocab_size, device=DEVICE)
+        
+        prompt = torch.tensor([[1, 2, 3, 4, 5]], device=DEVICE)
+        x = TokenArray(prompt, gen_length=5, mask_id=99, eos_id=98, device=DEVICE)
+        
+        # Decode with proposal_alpha > 1.0
+        conf_norm, conf_unnorm = decoder.decode(
+            logits, block_start=5, block_end=10, x=x, 
+            mcmc_alpha=4.0, proposal_alpha=2.0
+        )
+        
+        assert conf_norm is not None
+        assert conf_unnorm is not None
 
 
 # ============================================================================
@@ -488,129 +759,88 @@ def run_tests():
     # Test MCMCDiffusionIteration
     print("\n=== Testing MCMCDiffusionIteration ===")
     test_iteration = TestMCMCDiffusionIteration()
-    try:
-        test_iteration.test_init()
-        print("  test_init: PASSED")
-    except Exception as e:
-        print(f"  test_init: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_iteration.test_reset_confidences()
-        print("  test_reset_confidences: PASSED")
-    except Exception as e:
-        print(f"  test_reset_confidences: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_iteration.test_forward_no_cache()
-        print("  test_forward_no_cache: PASSED")
-    except Exception as e:
-        print(f"  test_forward_no_cache: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_iteration.test_confidence_accumulation()
-        print("  test_confidence_accumulation: PASSED")
-    except Exception as e:
-        print(f"  test_confidence_accumulation: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_iteration.test_different_alpha_values()
-        print("  test_different_alpha_values: PASSED")
-    except Exception as e:
-        print(f"  test_different_alpha_values: FAILED - {e}")
-        all_passed = False
+    for test_name in ['test_init', 'test_reset_confidences', 'test_forward_no_cache', 
+                      'test_confidence_accumulation', 'test_different_alpha_values']:
+        try:
+            getattr(test_iteration, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
     # Test MCMCBlockRunner
     print("\n=== Testing MCMCBlockRunner ===")
     test_runner = TestMCMCBlockRunner()
-    try:
-        test_runner.test_init()
-        print("  test_init: PASSED")
-    except Exception as e:
-        print(f"  test_init: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_runner.test_inheritance()
-        print("  test_inheritance: PASSED")
-    except Exception as e:
-        print(f"  test_inheritance: FAILED - {e}")
-        all_passed = False
+    for test_name in ['test_init', 'test_inheritance']:
+        try:
+            getattr(test_runner, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
     # Test MCMCProposalGenerator
     print("\n=== Testing MCMCProposalGenerator ===")
     test_generator = TestMCMCProposalGenerator()
-    try:
-        test_generator.test_init()
-        print("  test_init: PASSED")
-    except Exception as e:
-        print(f"  test_init: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_generator.test_generate_basic()
-        print("  test_generate_basic: PASSED")
-    except Exception as e:
-        print(f"  test_generate_basic: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_generator.test_generate_full_block()
-        print("  test_generate_full_block: PASSED")
-    except Exception as e:
-        print(f"  test_generate_full_block: FAILED - {e}")
-        all_passed = False
-    
+    for test_name in ['test_init', 'test_init_with_proposal_alpha', 
+                      'test_generate_basic', 'test_generate_full_block']:
+        try:
+            getattr(test_generator, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
+
     # Test MCMCRefinementRunner
     print("\n=== Testing MCMCRefinementRunner ===")
     test_refinement = TestMCMCRefinementRunner()
-    try:
-        test_refinement.test_init()
-        print("  test_init: PASSED")
-    except Exception as e:
-        print(f"  test_init: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_refinement.test_compute_log_acceptance_ratio()
-        print("  test_compute_log_acceptance_ratio: PASSED")
-    except Exception as e:
-        print(f"  test_compute_log_acceptance_ratio: FAILED - {e}")
-        all_passed = False
-    
-    try:
-        test_refinement.test_acceptance_ratio_symmetry()
-        print("  test_acceptance_ratio_symmetry: PASSED")
-    except Exception as e:
-        print(f"  test_acceptance_ratio_symmetry: FAILED - {e}")
-        all_passed = False
+    for test_name in ['test_init', 'test_compute_log_acceptance_ratio', 
+                      'test_acceptance_ratio_symmetry']:
+        try:
+            getattr(test_refinement, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
     # Test BlockMCMCDiffusionLLM
     print("\n=== Testing BlockMCMCDiffusionLLM ===")
     test_dllm = TestBlockMCMCDiffusionLLM()
-    try:
-        test_dllm.test_init_with_mcmc()
-        print("  test_init_with_mcmc: PASSED")
-    except Exception as e:
-        print(f"  test_init_with_mcmc: FAILED - {e}")
-        all_passed = False
+    for test_name in ['test_init_with_mcmc', 'test_init_without_mcmc', 
+                      'test_init_with_shift_mode', 'test_num_forwards_property',
+                      'test_proposal_alpha_parameter']:
+        try:
+            getattr(test_dllm, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
-    try:
-        test_dllm.test_init_without_mcmc()
-        print("  test_init_without_mcmc: PASSED")
-    except Exception as e:
-        print(f"  test_init_without_mcmc: FAILED - {e}")
-        all_passed = False
+    # Test Compatibility
+    print("\n=== Testing BlockMCMC Compatibility ===")
+    test_compat = TestBlockMCMCCompatibility()
+    for test_name in ['test_degraded_mode_uses_same_components', 
+                      'test_degraded_mode_with_shift_uses_same_components',
+                      'test_mcmc_mode_uses_mcmc_components',
+                      'test_inheritance_from_blockwise']:
+        try:
+            getattr(test_compat, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
-    try:
-        test_dllm.test_num_forwards_property()
-        print("  test_num_forwards_property: PASSED")
-    except Exception as e:
-        print(f"  test_num_forwards_property: FAILED - {e}")
-        all_passed = False
+    # Test MCMCThresholdParallelDecoder
+    print("\n=== Testing MCMCThresholdParallelDecoder ===")
+    test_decoder = TestMCMCThresholdParallelDecoder()
+    for test_name in ['test_init', 'test_inheritance', 
+                      'test_decode_returns_confidences', 'test_decode_with_proposal_alpha']:
+        try:
+            getattr(test_decoder, test_name)()
+            print(f"  {test_name}: PASSED")
+        except Exception as e:
+            print(f"  {test_name}: FAILED - {e}")
+            all_passed = False
     
     # Summary
     print("\n" + "="*60)
