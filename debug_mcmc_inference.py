@@ -103,6 +103,10 @@ def parse_args():
     parser.add_argument('--no_mcmc_kv_cache', action='store_true',
                         help='Disable KV cache in MCMC proposal generation')
     
+    # Proposal alpha settings
+    parser.add_argument('--proposal_alpha', type=float, default=1.0,
+                        help='Power parameter for proposal distribution in MCMC (default: 1.0)')
+    
     # Debug settings
     parser.add_argument('--disable_debug', action='store_true', help='Disable debug output')
     parser.add_argument('--prompt', type=str, default=None, help='Custom prompt')
@@ -209,6 +213,7 @@ def main():
     if args.enable_mcmc:
         print(f"  MCMC steps: {args.n_mcmc_steps}")
         print(f"  MCMC alpha: {args.mcmc_alpha}")
+        print(f"  Proposal alpha: {args.proposal_alpha}")
     
     print(f"\n💾 KV Cache Settings:")
     print(f"  Main KV cache: {args.use_kv_cache}")
@@ -264,7 +269,8 @@ def main():
         n_mcmc_steps=args.n_mcmc_steps,
         mcmc_alpha=args.mcmc_alpha,
         mcmc_temperature=args.mcmc_temperature,
-        mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # 新增：MCMC 提议生成是否使用 KV Cache
+        mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # MCMC 提议生成是否使用 KV Cache
+        proposal_alpha=args.proposal_alpha,  # 提议序列的 power scaling 参数
         tokenizer=tokenizer,
         verbose=False  # 关闭 verbose，使用我们自己的调试输出
     )

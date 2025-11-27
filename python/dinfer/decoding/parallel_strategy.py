@@ -296,6 +296,77 @@ def get_transfer_index_threshold(logits, temperature, mask_index, x, mask_id,
     transfer_index = confidence >= actual_threshold
     return x0, transfer_index
 
+
+# Power-scaled version for MCMC proposal generation
+@ torch.compile(dynamic=True)
+def get_transfer_index_threshold_power(logits, temperature, mask_index, x, mask_id,
+        threshold, alpha=1.0, rm_mask=True, use_float64=False, **kwargs):
+    """
+    Power-scaled threshold decoding for MCMC proposal generation.
+    
+    Key difference from get_transfer_index_threshold:
+    - Token selection (argmax) uses power-scaled logits: add_gumbel_noise_power(logits, alpha)
+    - Confidence calculation uses ORIGINAL logits: softmax(logits)
+    
+    This ensures:
+    - Proposal distribution q(x'|x) is more concentrated on high-probability tokens
+    - But probability calculation remains consistent with the original distribution
+    
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Model logits [batch, seq_len, vocab_size]
+    temperature : float
+        Temperature for Gumbel noise
+    mask_index : torch.Tensor
+        Boolean mask indicating positions to decode [batch, seq_len]
+    x : torch.Tensor
+        Current token sequence [batch, seq_len]
+    mask_id : int
+        ID of mask token
+    threshold : float
+        Confidence threshold for transfer
+    alpha : float
+        Power parameter for proposal distribution (default: 1.0 means no power scaling)
+    rm_mask : bool
+        Whether to ensure decoded tokens are not mask_id
+    use_float64 : bool
+        Whether to use float64 for softmax
+    
+    Returns
+    -------
+    x0 : torch.Tensor
+        Decoded tokens [batch, seq_len]
+    transfer_index : torch.Tensor
+        Boolean mask indicating which tokens to transfer [batch, seq_len]
+    """
+    from .utils import add_gumbel_noise_power
+    
+    # Step 1: Use power-scaled Gumbel noise for token selection
+    # This makes the proposal distribution more concentrated on high-probability tokens
+    logits_with_noise = add_gumbel_noise_power(logits, alpha=alpha, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
+    
+    # Step 2: Calculate confidence using ORIGINAL logits (not power-scaled)
+    # This ensures q(x'|x) and q(x|x') are computed consistently
+    if use_float64:
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+    else:
+        p = F.softmax(logits.to(torch.float32), dim=-1)
+    x0_p = torch.squeeze(
+        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
+    
+    # Step 3: Ensure decoded tokens are not mask_id
+    if rm_mask:
+        mask_index = mask_index & (x0 != mask_id)
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+    
+    # Step 4: Apply threshold
+    actual_threshold = (torch.max(confidence, dim=1)[0]-1e-5).clamp(-1000, threshold).unsqueeze(-1)
+    transfer_index = confidence >= actual_threshold
+    return x0, transfer_index
+
 class ThresholdParallelDecoder(ParallelDecoder):
     """ This decoder deocdes tokens in parallel based on a threshold.
 
@@ -329,12 +400,34 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
     # 调试开关
     DEBUG_MCMC_DECODER = False
 
-    def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None):
+    def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None, proposal_alpha=1.0):
         """解码并返回双重置信度
 
-        Returns:
-            confidences_norm: 归一化置信度 (alpha=1.0)
-            confidences_unnorm: 非归一化置信度 (alpha=mcmc_alpha)
+        Parameters
+        ----------
+        logits : torch.Tensor
+            Model logits
+        block_start : int
+            Block start position
+        block_end : int
+            Block end position
+        x : torch.Tensor
+            Token array
+        mcmc_alpha : float
+            Power parameter for target distribution p^α (default: 1.0)
+        iter_threshold : float
+            Iteration-specific threshold (default: None, uses self.threshold)
+        proposal_alpha : float
+            Power parameter for proposal distribution (default: 1.0)
+            - proposal_alpha=1.0: standard decoding (original sequence)
+            - proposal_alpha>1.0: power-scaled decoding (proposal sequence)
+
+        Returns
+        -------
+        confidences_norm : torch.Tensor
+            Normalized log probabilities (alpha=1.0)
+        confidences_unnorm : torch.Tensor
+            Unnormalized log probabilities (alpha=mcmc_alpha)
         """
         if iter_threshold is None:
             iter_threshold = self.threshold
@@ -346,16 +439,25 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
         # DEBUG: 记录 mask 数量
         num_masks_before = mask_index.sum().item()
 
-        # 调用 get_transfer_index_threshold 获取 x0 和 transfer_index
-        x0, transfer_index_raw = get_transfer_index_threshold(
-            logits, self.temperature, mask_index, curr_x,
-            self.mask_id, threshold=iter_threshold, use_float64=self.use_float64
-        )
+        # 根据 proposal_alpha 选择合适的解码函数
+        if proposal_alpha == 1.0:
+            # 原始序列：使用标准阈值解码
+            x0, transfer_index_raw = get_transfer_index_threshold(
+                logits, self.temperature, mask_index, curr_x,
+                self.mask_id, threshold=iter_threshold, use_float64=self.use_float64
+            )
+        else:
+            # 提议序列：使用 power-scaled 解码
+            x0, transfer_index_raw = get_transfer_index_threshold_power(
+                logits, self.temperature, mask_index, curr_x,
+                self.mask_id, threshold=iter_threshold, alpha=proposal_alpha,
+                use_float64=self.use_float64
+            )
         
         # DEBUG: 记录 transfer_index 数量（在 AND mask_index 之前）
         num_transfer_raw = transfer_index_raw.sum().item()
 
-        # 计算双重置信度
+        # 计算双重置信度（始终使用原始 logits，不受 proposal_alpha 影响）
         log_p_norm = F.log_softmax(logits, dim=-1)
         log_p_unnorm = F.log_softmax(mcmc_alpha * logits, dim=-1)
 
@@ -389,7 +491,7 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
             print(f"[MCMCDecoder] block=[{block_start},{block_end}), "
                   f"masks: {num_masks_before}->{num_masks_after}, "
                   f"transfer_raw={num_transfer_raw}, transfer_final={num_transfer_final}, "
-                  f"conf_updated={num_conf_updated}")
+                  f"conf_updated={num_conf_updated}, proposal_alpha={proposal_alpha}")
 
         return confidences_norm, confidences_unnorm
 

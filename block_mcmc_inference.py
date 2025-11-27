@@ -110,8 +110,13 @@ Examples:
     parser.add_argument('--no_mcmc_kv_cache', action='store_true',
                         help='Disable KV cache in MCMC proposal generation (even if main decoding uses KV cache)')
     
+    # Proposal alpha settings
+    parser.add_argument('--proposal_alpha', type=float, default=2.0,
+                        help='Power parameter for proposal distribution in MCMC (default: 2.0). '
+                             'Higher values make proposals more concentrated on high-probability tokens.')
+    
     # Output settings
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--verbose', action='store_true', default= True, help='Enable verbose output')
     parser.add_argument('--prompt', type=str, default=None, help='Custom prompt')
     
     args = parser.parse_args()
@@ -157,6 +162,7 @@ def print_version_info():
 def setup_distributed():
     """Initialize distributed environment"""
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12346'
     
@@ -212,7 +218,8 @@ def create_dllm(model, tokenizer, args):
         n_mcmc_steps=args.n_mcmc_steps,
         mcmc_alpha=args.mcmc_alpha,
         mcmc_temperature=args.mcmc_temperature,
-        mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # 新增：MCMC 提议生成是否使用 KV Cache
+        mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # MCMC 提议生成是否使用 KV Cache
+        proposal_alpha=args.proposal_alpha,  # 提议序列的 power scaling 参数
         tokenizer=tokenizer,
         verbose=args.verbose
     )
@@ -256,6 +263,7 @@ def main():
         print(f"  MCMC steps: {args.n_mcmc_steps}")
         print(f"  MCMC alpha: {args.mcmc_alpha}")
         print(f"  MCMC temperature: {args.mcmc_temperature}")
+        print(f"  Proposal alpha: {args.proposal_alpha}")
     
     print(f"\n💾 KV Cache Settings:")
     print(f"  Main KV cache: {args.use_kv_cache}")
