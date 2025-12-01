@@ -1393,7 +1393,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                 if self.DEBUG_MCMC_GENERATE:
                     print(f"[Phase 2 DONE] block={block_id}, acceptance_rate={acceptance_rate:.2%}")
                 
-                logger.info(f'Block {block_id} MCMC acceptance rate: {acceptance_rate:.2%}')
+                # logger.info(f'Block {block_id} MCMC acceptance rate: {acceptance_rate:.2%}')
             
             # Early stop if all sequences have EOS
             if torch.all(decode_compl):
@@ -2000,9 +2000,12 @@ class MCMCRefinementRunner:
                 verbose=verbose
             )
             
-            # Step 5: 接受/拒绝决策
+            # Step 5: 贪婪接受/拒绝决策（max_swap 策略）
+            # 只接受 log_r > 0 的提议（即只接受更好的序列）
             accept_prob = min(1.0, np.exp(min(log_r, 0.0)))
-            accepted = self._sync_random_uniform(x.device) < accept_prob
+            # accepted = self._sync_random_uniform(x.device) < accept_prob
+            accepted = accept_prob >= 1
+
             
             if verbose and tokenizer is not None:
                 print(f"\n[MCMC Step {mcmc_step+1}/{self.n_mcmc_steps}] idx={idx}, "
@@ -2142,7 +2145,11 @@ class MCMCRefinementRunner:
         sum_target_cur = sum(log_target_cur)
         sum_q_forward = sum(log_q_forward)
         
-        log_r = sum_target_prop + sum_q_reverse - sum_target_cur - sum_q_forward
+        # 贪婪接受率（max_swap 策略）: log r = log[p^α(x')] - log[p^α(x)]
+        # 只比较目标分布概率，不需要提议概率
+        log_r = sum_target_prop - sum_target_cur
+        # log_r = sum_target_prop + sum_q_reverse - sum_target_cur - sum_q_forward
+
         
         if verbose:
             print(f"[Acceptance Ratio] Components:")

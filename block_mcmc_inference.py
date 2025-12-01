@@ -4,42 +4,48 @@ BlockMCMC Inference Script
 使用 BlockMCMCDiffusionLLM 进行推理，支持 MCMC Power Sampling 精炼。
 
 ================================================================================
+参数说明
+================================================================================
+- mcmc_alpha: 目标分布的 power 参数，用于计算置信度 log p^α(x)，影响 MH 接受率
+- proposal_alpha: 提议分布的 power 参数，用于 token 选择时的 logits scaling
+  - proposal_alpha=1.0: 标准解码（与 Phase 1 相同）
+  - proposal_alpha>1.0: power-scaled 解码，提议更集中于高概率 token
+- mcmc_temperature: 提议分布温度（默认 0.9）
+- use_shift: 是否使用 shift 解码（仅在 enable_mcmc=False 时生效）
+
+================================================================================
 常用命令示例
 ================================================================================
 
 # 1. 基本使用（默认启用 MCMC，不使用 KV Cache）
-python block_mcmc_inference.py
-
-# 2. 禁用 MCMC（仅使用扩散解码）
-python block_mcmc_inference.py --disable_mcmc
-
-# 3. 使用 KV Cache（prefix 模式）
-python block_mcmc_inference.py --use_kv_cache --kv_cache_type prefix
-
-# 4. 使用 KV Cache（dual 模式，推荐）
-python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual
-
-# 5. MCMC 提议生成使用 KV Cache 加速（需要先启用 KV Cache）
-python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --mcmc_use_kv_cache
-
-# 6. MCMC 提议生成不使用 KV Cache（即使主解码使用 KV Cache）
-python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --no_mcmc_kv_cache
-
-# 7. 完整配置示例（推荐生产环境）
-python block_mcmc_inference.py \\
-    --use_kv_cache --kv_cache_type dual \\
-    --enable_mcmc --n_mcmc_steps 3 --mcmc_alpha 4.0 \\
-    --mcmc_use_kv_cache \\
-    --gen_length 256 --block_length 32
-
-# 8. 调试模式（详细输出）
 python block_mcmc_inference.py --verbose
 
-# 9. 自定义 prompt
-python block_mcmc_inference.py --prompt "What is the capital of France?"
+# 2. 禁用 MCMC（仅使用扩散解码，退化为 BlockWiseDiffusionLLM）
+python block_mcmc_inference.py --disable_mcmc --verbose
 
-# 10. 打印版本和配置信息
-python block_mcmc_inference.py --version
+# 3. 使用 KV Cache（prefix 模式）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type prefix --verbose
+
+# 4. 使用 KV Cache（dual 模式，推荐）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --verbose
+
+# 5. MCMC 提议生成使用 KV Cache 加速（需要先启用 KV Cache）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --mcmc_use_kv_cache --verbose
+
+# 6. MCMC 提议生成不使用 KV Cache（即使主解码使用 KV Cache）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --no_mcmc_kv_cache --verbose
+
+# 7. 使用 power-scaled 提议分布（proposal_alpha=4.0）
+python block_mcmc_inference.py --proposal_alpha 4.0 --verbose
+
+# 8. 完整配置示例（推荐生产环境）
+python block_mcmc_inference.py \\
+    --use_kv_cache --kv_cache_type dual \\
+    --enable_mcmc --n_mcmc_steps 3 \\
+    --mcmc_alpha 4.0 --proposal_alpha 1.0 \\
+    --mcmc_use_kv_cache \\
+    --gen_length 256 --block_length 32 \\
+    --verbose
 
 ================================================================================
 """
@@ -96,8 +102,8 @@ Examples:
     parser.add_argument('--enable_mcmc', action='store_true', default=True, help='Enable MCMC refinement')
     parser.add_argument('--disable_mcmc', action='store_true', help='Disable MCMC refinement')
     parser.add_argument('--n_mcmc_steps', type=int, default=3, help='Number of MCMC steps per block')
-    parser.add_argument('--mcmc_alpha', type=float, default=4.0, help='MCMC alpha (power parameter)')
-    parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature')
+    parser.add_argument('--mcmc_alpha', type=float, default=4.0, help='MCMC alpha (power parameter for target distribution)')
+    parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature (default: 0.9)')
     
     # KV Cache settings
     parser.add_argument('--use_kv_cache', action='store_true', help='Enable KV cache for main decoding')
@@ -111,9 +117,13 @@ Examples:
                         help='Disable KV cache in MCMC proposal generation (even if main decoding uses KV cache)')
     
     # Proposal alpha settings
-    parser.add_argument('--proposal_alpha', type=float, default=2.0,
-                        help='Power parameter for proposal distribution in MCMC (default: 2.0). '
-                             'Higher values make proposals more concentrated on high-probability tokens.')
+    parser.add_argument('--proposal_alpha', type=float, default=4.0,
+                        help='Power parameter for proposal distribution in MCMC (default: 4.0). '
+                             '1.0 = standard decoding, >1.0 = power-scaled decoding for better proposal quality.')
+    
+    # Shift decoding (only effective when enable_mcmc=False)
+    parser.add_argument('--use_shift', action='store_true', default=False,
+                        help='Use shift decoding (only effective when MCMC is disabled)')
     
     # Output settings
     parser.add_argument('--verbose', action='store_true', default= True, help='Enable verbose output')
@@ -220,6 +230,7 @@ def create_dllm(model, tokenizer, args):
         mcmc_temperature=args.mcmc_temperature,
         mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # MCMC 提议生成是否使用 KV Cache
         proposal_alpha=args.proposal_alpha,  # 提议序列的 power scaling 参数
+        use_shift=args.use_shift,  # 是否使用 shift 解码 (仅在 enable_mcmc=False 时生效)
         tokenizer=tokenizer,
         verbose=args.verbose
     )
@@ -261,9 +272,11 @@ def main():
     print(f"  MCMC enabled: {args.enable_mcmc}")
     if args.enable_mcmc:
         print(f"  MCMC steps: {args.n_mcmc_steps}")
-        print(f"  MCMC alpha: {args.mcmc_alpha}")
+        print(f"  MCMC alpha (target): {args.mcmc_alpha}")
         print(f"  MCMC temperature: {args.mcmc_temperature}")
         print(f"  Proposal alpha: {args.proposal_alpha}")
+    else:
+        print(f"  Use shift: {args.use_shift}")
     
     print(f"\n💾 KV Cache Settings:")
     print(f"  Main KV cache: {args.use_kv_cache}")

@@ -3,6 +3,16 @@ Debug script for BlockMCMC inference.
 Enables all debug flags to trace the confidence tracking and KV Cache behavior.
 
 ================================================================================
+参数说明
+================================================================================
+- mcmc_alpha: 目标分布的 power 参数，用于计算置信度 log p^α(x)，影响 MH 接受率
+- proposal_alpha: 提议分布的 power 参数，用于 token 选择时的 logits scaling
+  - proposal_alpha=1.0: 标准解码（与 Phase 1 相同）
+  - proposal_alpha>1.0: power-scaled 解码，提议更集中于高概率 token
+- mcmc_temperature: 提议分布温度（默认 0.9）
+- use_shift: 是否使用 shift 解码（仅在 enable_mcmc=False 时生效）
+
+================================================================================
 常用命令示例
 ================================================================================
 
@@ -27,17 +37,20 @@ python debug_mcmc_inference.py --n_mcmc_steps 1 --gen_length 64 --block_length 3
 # 7. 调试多步 MCMC
 python debug_mcmc_inference.py --n_mcmc_steps 5 --gen_length 128 --block_length 32
 
-# 8. 禁用 MCMC 调试（仅调试扩散解码）
+# 8. 禁用 MCMC 调试（仅调试扩散解码，退化为 BlockWiseDiffusionLLM）
 python debug_mcmc_inference.py --disable_mcmc
 
-# 9. 打印版本和配置信息
-python debug_mcmc_inference.py --version
 
-# 10. 完整调试配置
+# 10. 调试 power-scaled 提议分布（proposal_alpha=4.0）
+python debug_mcmc_inference.py --proposal_alpha 4.0 --n_mcmc_steps 2
+
+
+# 12. 完整调试配置
 python debug_mcmc_inference.py \\
     --use_kv_cache --kv_cache_type dual \\
     --mcmc_use_kv_cache \\
     --n_mcmc_steps 2 \\
+    --mcmc_alpha 4.0 --proposal_alpha 1.0 \\
     --gen_length 128 --block_length 32
 
 ================================================================================
@@ -89,8 +102,8 @@ def parse_args():
     parser.add_argument('--enable_mcmc', action='store_true', default=True, help='Enable MCMC refinement')
     parser.add_argument('--disable_mcmc', action='store_true', help='Disable MCMC refinement')
     parser.add_argument('--n_mcmc_steps', type=int, default=1, help='Number of MCMC steps per block (default: 1 for debug)')
-    parser.add_argument('--mcmc_alpha', type=float, default=4.0, help='MCMC alpha (power parameter)')
-    parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature')
+    parser.add_argument('--mcmc_alpha', type=float, default=4.0, help='MCMC alpha (power parameter for target distribution)')
+    parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature (default: 0.9)')
     
     # KV Cache settings
     parser.add_argument('--use_kv_cache', action='store_true', help='Enable KV cache for main decoding')
@@ -104,8 +117,13 @@ def parse_args():
                         help='Disable KV cache in MCMC proposal generation')
     
     # Proposal alpha settings
-    parser.add_argument('--proposal_alpha', type=float, default=1.0,
-                        help='Power parameter for proposal distribution in MCMC (default: 1.0)')
+    parser.add_argument('--proposal_alpha', type=float, default=4.0,
+                        help='Power parameter for proposal distribution in MCMC (default: 1.0). '
+                             '1.0 = standard decoding, >1.0 = power-scaled decoding.')
+    
+    # Shift decoding (only effective when enable_mcmc=False)
+    parser.add_argument('--use_shift', action='store_true', default=False,
+                        help='Use shift decoding (only effective when MCMC is disabled)')
     
     # Debug settings
     parser.add_argument('--disable_debug', action='store_true', help='Disable debug output')
@@ -212,8 +230,11 @@ def main():
     print(f"  MCMC enabled: {args.enable_mcmc}")
     if args.enable_mcmc:
         print(f"  MCMC steps: {args.n_mcmc_steps}")
-        print(f"  MCMC alpha: {args.mcmc_alpha}")
+        print(f"  MCMC alpha (target): {args.mcmc_alpha}")
+        print(f"  MCMC temperature: {args.mcmc_temperature}")
         print(f"  Proposal alpha: {args.proposal_alpha}")
+    else:
+        print(f"  Use shift: {args.use_shift}")
     
     print(f"\n💾 KV Cache Settings:")
     print(f"  Main KV cache: {args.use_kv_cache}")
@@ -271,6 +292,7 @@ def main():
         mcmc_temperature=args.mcmc_temperature,
         mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # MCMC 提议生成是否使用 KV Cache
         proposal_alpha=args.proposal_alpha,  # 提议序列的 power scaling 参数
+        use_shift=args.use_shift,  # 是否使用 shift 解码 (仅在 enable_mcmc=False 时生效)
         tokenizer=tokenizer,
         verbose=False  # 关闭 verbose，使用我们自己的调试输出
     )
