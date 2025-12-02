@@ -1393,15 +1393,17 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                 if self.DEBUG_MCMC_GENERATE:
                     print(f"[Phase 2 DONE] block={block_id}, acceptance_rate={acceptance_rate:.2%}")
                 
-                # logger.info(f'Block {block_id} MCMC acceptance rate: {acceptance_rate:.2%}')
+                # 只在 rank 0 打印，避免多 GPU 重复
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    logger.info(f'Block {block_id} MCMC acceptance rate: {acceptance_rate:.2%}')
             
             # Early stop if all sequences have EOS
             if torch.all(decode_compl):
                 if self.DEBUG_MCMC_GENERATE:
                     print(f"[EARLY STOP] EOS detected, stopping at block {block_id}")
                 break
-        
-        logger.info(f'The number of diffusion iterations: {self.num_forwards}')
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(f'The number of diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 
 
@@ -1688,7 +1690,7 @@ class MCMCProposalGenerator:
         self.model = model
         self.decoder = decoder
         self.mcmc_alpha = mcmc_alpha
-        self.mcmc_temperature = mcmc_temperature  # 保留接口，但实际使用 decoder 的 temperature
+        self.mcmc_temperature = mcmc_temperature  # 用于 proposal 生成时的 Gumbel noise temperature
         self.use_kv_cache = use_kv_cache
         self.proposal_alpha = proposal_alpha  # 提议序列的 power scaling 参数
         self.num_forwards = 0
@@ -1827,7 +1829,8 @@ class MCMCProposalGenerator:
                 conf_norm_block, conf_unnorm_block = self.decoder.decode(
                     logits, idx, block_end, x_prop,
                     mcmc_alpha=self.mcmc_alpha,
-                    proposal_alpha=self.proposal_alpha
+                    proposal_alpha=self.proposal_alpha,
+                    temperature=self.mcmc_temperature  # 传递 mcmc_temperature 用于 Gumbel noise
                 )
                 
                 # 更新 q(x'|x) 置信度

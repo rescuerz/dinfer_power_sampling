@@ -400,7 +400,7 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
     # 调试开关
     DEBUG_MCMC_DECODER = False
 
-    def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None, proposal_alpha=1.0):
+    def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None, proposal_alpha=1.0, temperature=None):
         """解码并返回双重置信度
 
         Parameters
@@ -421,6 +421,9 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
             Power parameter for proposal distribution (default: 1.0)
             - proposal_alpha=1.0: standard decoding (original sequence)
             - proposal_alpha>1.0: power-scaled decoding (proposal sequence)
+        temperature : float
+            Temperature for Gumbel noise sampling (default: None, uses self.temperature)
+            When proposal_alpha > 1.0, this should be set to mcmc_temperature for proper sampling
 
         Returns
         -------
@@ -431,6 +434,9 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
         """
         if iter_threshold is None:
             iter_threshold = self.threshold
+        
+        # 使用传入的 temperature，如果没有传入则使用 decoder 自身的 temperature
+        actual_temperature = temperature if temperature is not None else self.temperature
 
         mask_index = (x[:, block_start:block_end] == self.mask_id)
         assert mask_index.shape[1] == logits.shape[1]
@@ -443,13 +449,13 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
         if proposal_alpha == 1.0:
             # 原始序列：使用标准阈值解码
             x0, transfer_index_raw = get_transfer_index_threshold(
-                logits, self.temperature, mask_index, curr_x,
+                logits, actual_temperature, mask_index, curr_x,
                 self.mask_id, threshold=iter_threshold, use_float64=self.use_float64
             )
         else:
             # 提议序列：使用 power-scaled 解码
             x0, transfer_index_raw = get_transfer_index_threshold_power(
-                logits, self.temperature, mask_index, curr_x,
+                logits, actual_temperature, mask_index, curr_x,
                 self.mask_id, threshold=iter_threshold, alpha=proposal_alpha,
                 use_float64=self.use_float64
             )
